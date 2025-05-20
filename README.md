@@ -1,4 +1,4 @@
-The server component - srtla_rec - in this repository is unsupported, no longer under development and not suitable for production deployment. Sign up for a [BELABOX cloud](https://belabox.net/cloud) account to benefit from the latest improvements, available on a global network of relay servers.
+The server component - srtla_rec - in this repository isunsupported, no longer under development and not suitable for production deployment. Sign up for a [BELABOX cloud](https://belabox.net/cloud) account to benefit from the latest improvements, available on a global network of relay servers.
 =====
 
 srtla - SRT transport proxy with link aggregation for connection bonding
@@ -95,3 +95,60 @@ Error responses are only sent from the *receiver*. If the *sender* encounters an
 * `SRTLA_REG_ERR` - Can be sent in response to any `SRTLA_REG` command. Operation temporarily failed, back off and retry later.
 * `SRTLA_REG_NAK` - Sent in response to `SRTLA_REG1`. Operation refused, give up. Either incompatible or access denied. A human-readable error message may be appended after the header.
 * `SRTLA_REG_NGP` - Sent in response to `SRTLA_REG2` with an invalid ID. Register the group again with `SRTLA_REG1`
+
+## Running srtla_rec as a Windows Service
+
+If you want to run `srtla_rec.exe` as a service on Windows, follow these detailed steps:
+
+1. **Prepare the Executable**
+   - Make sure you have a compiled `srtla_rec.exe` file. Note its full path, for example: `C:\srtla\srtla_rec.exe`.
+
+2. **Download NSSM (Non-Sucking Service Manager)**
+   - NSSM is a tool that allows you to run any application as a Windows service.
+   - Download it from [https://nssm.cc/download](https://nssm.cc/download) and extract the ZIP file to a folder (e.g., `C:\nssm`).
+
+3. **Open Command Prompt as Administrator**
+   - Click Start, type `cmd`, right-click on Command Prompt, and select "Run as administrator".
+
+4. **Install the Service with NSSM**
+   - Change directory to where `nssm.exe` is located (e.g., `cd C:\nssm\win64` or `cd C:\nssm\win32` depending on your system).
+   - Run the following command:
+     ```cmd
+     nssm install srtla_rec
+     ```
+   - In the NSSM GUI window that appears:
+     - For **Application path**, browse and select your `srtla_rec.exe` file.
+     - For **Arguments**, enter the required arguments for your use case (e.g., `5000 127.0.0.1 5002`).
+     - (Optional) Set the **Startup directory** to the folder containing `srtla_rec.exe`.
+     - (Optional) Under the "Details" tab, you can set a display name and description for the service.
+     - (Optional) Under the "Log on" tab, you can specify which user account the service should run as (default is Local System).
+     - Click "Install service" to finish.
+
+5. **Start the Service**
+   - In the same command prompt, start the service with:
+     ```cmd
+     net start srtla_rec
+     ```
+   - Alternatively, open the Services management console (`services.msc`), find `srtla_rec`, right-click and select "Start".
+
+6. **Stop or Remove the Service**
+   - To stop the service:
+     ```cmd
+     net stop srtla_rec
+     ```
+   - To remove the service completely:
+     ```cmd
+     nssm remove srtla_rec confirm
+     ```
+
+**Notes:**
+- NSSM is only needed for the initial setup. Once installed, the service will start automatically with Windows (unless you set it to manual start).
+- You can configure recovery options, environment variables, and logging in the NSSM GUI during setup.
+- If you update `srtla_rec.exe`, stop the service, replace the executable, and start the service again.
+- For troubleshooting, check the Windows Event Viewer or the log files if you configured logging in NSSM.
+
+## Windows Build Support
+
+This repository is designed to allow building and running the `srtla_rec` and `srtla_send` applications as native Windows executables. You can compile the source code on Windows using a compatible C compiler (such as MinGW or Microsoft Visual Studio). After compilation, you will have `.exe` files (`srtla_rec.exe` and `srtla_send.exe`) that can be executed directly on Windows systems, without the need for WSL or a Linux environment.
+
+This enables seamless integration with Windows environments, including the ability to run `srtla_rec.exe` as a Windows service (see the section above for detailed instructions).
