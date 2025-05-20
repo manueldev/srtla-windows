@@ -60,21 +60,51 @@ int parse_port(char *port_str) {
   return port;
 }
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 int get_seconds(time_t *s) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    static int initialized = 0;
+    LARGE_INTEGER counter;
+    if (!initialized) {
+        QueryPerformanceFrequency(&freq);
+        initialized = 1;
+    }
+    QueryPerformanceCounter(&counter);
+    *s = (time_t)(counter.QuadPart / freq.QuadPart);
+    return 0;
+#else
   struct timespec ts;
-  int ret = clock_gettime(CLOCK_MONOTONIC, &ts);
+  int ret = clock_gettime(CLOCK_MONOTONIC , &ts);
   if (ret != 0) return -1;
   *s = ts.tv_sec;
   return 0;
+#endif
 }
 
 int get_ms(uint64_t *ms) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    static int initialized = 0;
+    LARGE_INTEGER counter;
+    if (!initialized) {
+        QueryPerformanceFrequency(&freq);
+        initialized = 1;
+    }
+    QueryPerformanceCounter(&counter);
+    *ms = (uint64_t)(counter.QuadPart * 1000 / freq.QuadPart);
+    return 0;
+#else
   struct timespec ts;
-  int ret = clock_gettime(CLOCK_MONOTONIC, &ts);
+  int ret = clock_gettime(CLOCK_MONOTONIC , &ts);
   if (ret != 0) return -1;
   *ms = ((uint64_t)(ts.tv_sec)) * 1000 + ((uint64_t)(ts.tv_nsec)) / 1000 / 1000;
 
   return 0;
+#endif
 }
 
 int32_t get_srt_sn(void *pkt, int n) {

@@ -1,0 +1,38 @@
+# Compiled object files
+*.o
+
+# Executable files
+*.exe
+
+# Dependency files
+*.d
+
+# Precompiled Headers
+*.gch
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Build output
+/build/
+
+# Logs
+*.log
+
+# Ignore core dumps
+core*
+
+# Ignore user-specific files
+*.user
+*.suo
+*.vcxproj.user
+
+# Ignore deployment artifacts
+/deploy_srtla_rec/*.service
+/deploy_srtla_rec/srtla_rec_default
+/deploy_srtla_rec/install.sh

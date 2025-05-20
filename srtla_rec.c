@@ -26,7 +26,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#ifdef __linux__
 #include <sys/epoll.h>
+#endif
 #include <errno.h>
 
 #include "common.h"
@@ -76,6 +78,7 @@ FILE *urandom;
 Async I/O support
 
 */
+#ifdef __linux__
 int socket_epoll;
 
 int epoll_add(int fd, uint32_t events, void *userdata) {
@@ -89,7 +92,7 @@ int epoll_rem(int fd) {
   struct epoll_event ev; // non-NULL for Linux < 2.6.9, however unlikely it is
   return epoll_ctl(socket_epoll, EPOLL_CTL_DEL, fd, &ev);
 }
-
+#endif
 
 /*
 
@@ -196,7 +199,9 @@ int group_destroy(conn_group_t *g, conn_group_t **prev_link) {
   }
 
   if (g->srt_sock > 0) {
+#ifdef __linux__
     epoll_rem(g->srt_sock);
+#endif
     close(g->srt_sock);
   }
 
@@ -473,12 +478,14 @@ void handle_srtla_data(time_t ts) {
       return;
     }
 
+#ifdef __linux__
     ret = epoll_add(sock, EPOLLIN, g);
-    if (ret != 0) {
+    if (ret < 0) {
       err("Group %p: failed to add the SRT socket to the epoll\n", g);
       group_destroy(g, NULL);
       return;
     }
+#endif
   }
 
   ret = send(g->srt_sock, &buf, n, 0);
@@ -652,12 +659,14 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
+#ifdef __linux__
   // We use epoll for event-driven network I/O
   socket_epoll = epoll_create(1000); // the number is ignored since Linux 2.6.8
   if (socket_epoll < 0) {
-    perror("epoll creation failed\n");
-    exit(EXIT_FAILURE);
+    perror("epoll_create");
+    exit(1);
   }
+#endif
 
   // Set up the listener socket for incoming SRT connections
   listen_addr.sin_family = AF_INET;
@@ -675,15 +684,18 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
+#ifdef __linux__
   ret = epoll_add(srtla_sock, EPOLLIN, NULL);
   if (ret != 0) {
     perror("failed to add the srtla sock to the epoll\n");
     exit(EXIT_FAILURE);
   }
+#endif
 
   info("srtla_rec is now running\n");
 
   while(1) {
+#ifdef __linux__
     #define MAX_EPOLL_EVENTS 10
     struct epoll_event events[MAX_EPOLL_EVENTS];
     int eventcnt = epoll_wait(socket_epoll, events, MAX_EPOLL_EVENTS, 1000);
@@ -693,7 +705,6 @@ int main(int argc, char **argv) {
     if (ret != 0) {
       err("Failed to get the timestamp\n");
     }
-
     int group_cnt;
     for (int i = 0; i < eventcnt; i++) {
       group_cnt = group_count;
@@ -702,14 +713,40 @@ int main(int argc, char **argv) {
       } else {
         handle_srt_data((conn_group_t*)events[i].data.ptr);
       }
-
-      /* If we've removed a group due to a socket error, then we might have
-         pending events already waiting for us in events[], and now pointing
-         to freed() memory. Get an updated list from epoll_wait() */
       if (group_count < group_cnt) break;
-    } // for
-
+    }
     connection_cleanup(ts);
+#else
+    time_t ts = 0;
+    int ret = get_seconds(&ts);
+    if (ret != 0) {
+      err("Failed to get the timestamp\n");
+    }
+    // Windows için select() ile hem srtla_sock hem de tüm aktif SRT socket'lerini dinle
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    int maxfd = srtla_sock;
+    FD_SET(srtla_sock, &readfds);
+    for (conn_group_t *g = groups; g != NULL; g = g->next) {
+      if (g->srt_sock > 0) {
+        FD_SET(g->srt_sock, &readfds);
+        if (g->srt_sock > maxfd) maxfd = g->srt_sock;
+      }
+    }
+    struct timeval tv = {0, 100000}; // 100ms
+    int ready = select(maxfd + 1, &readfds, NULL, NULL, &tv);
+    if (ready > 0) {
+      if (FD_ISSET(srtla_sock, &readfds)) {
+        handle_srtla_data(ts);
+      }
+      for (conn_group_t *g = groups; g != NULL; g = g->next) {
+        if (g->srt_sock > 0 && FD_ISSET(g->srt_sock, &readfds)) {
+          handle_srt_data(g);
+        }
+      }
+    }
+    connection_cleanup(ts);
+#endif
   } // while(1);
 }
 
