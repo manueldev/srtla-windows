@@ -62,7 +62,7 @@ int parse_port(char *port_str) {
 
 int get_seconds(time_t *s) {
   struct timespec ts;
-  int ret = clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+  int ret = clock_gettime(CLOCK_MONOTONIC, &ts);
   if (ret != 0) return -1;
   *s = ts.tv_sec;
   return 0;
@@ -70,7 +70,7 @@ int get_seconds(time_t *s) {
 
 int get_ms(uint64_t *ms) {
   struct timespec ts;
-  int ret = clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+  int ret = clock_gettime(CLOCK_MONOTONIC, &ts);
   if (ret != 0) return -1;
   *ms = ((uint64_t)(ts.tv_sec)) * 1000 + ((uint64_t)(ts.tv_nsec)) / 1000 / 1000;
 
