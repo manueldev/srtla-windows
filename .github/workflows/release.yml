@@ -18,14 +18,14 @@ jobs:
           fetch-depth: 0  # Tüm commit geçmişini al (version bilgisi için)
       
       - name: Set up MinGW (GCC for Windows)
-        uses: egor-tensin/setup-mingw@v2
+        uses: bwoodsend/setup-winlibs-action@v1
         with:
-          platform: x64
+          architecture: x86_64
       
       - name: Get tag name
         id: get_tag
-        run: echo "TAG_NAME=${{ github.ref_name }}" >> $env:GITHUB_ENV
-        shell: pwsh
+        run: echo "TAG_NAME=%GITHUB_REF_NAME%" >> %GITHUB_ENV%
+        shell: cmd
       
       - name: Show environment
         run: |
@@ -53,7 +53,7 @@ jobs:
       - name: Create Release ZIP
         run: |
           cd release-files
-          7z a -tzip ..\srtla-windows-${{ env.TAG_NAME }}.zip *
+          powershell Compress-Archive * ..\srtla-windows-%TAG_NAME%.zip
           cd ..
           dir
         shell: cmd
