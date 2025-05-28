@@ -16,6 +16,8 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include <stdint.h>
+
 #define MTU 1500
 
 #define SRT_TYPE_HANDSHAKE   0x8000
@@ -106,3 +108,21 @@ int is_srtla_keepalive(void *pkt, int len);
 int is_srtla_reg1(void *pkt, int len);
 int is_srtla_reg2(void *pkt, int len);
 int is_srtla_reg3(void *pkt, int len);
+
+#ifdef _WIN32
+// Windows için byte order makroları
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifndef htobe16
+#define htobe16(x) htons(x)
+#endif
+#ifndef be32toh
+#define be32toh(x) ntohl(x)
+#endif
+#ifndef htobe32
+#define htobe32(x) htonl(x)
+#endif
+#ifndef be16toh
+#define be16toh(x) ntohs(x)
+#endif
+#endif

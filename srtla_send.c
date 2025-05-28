@@ -20,14 +20,23 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-#include <unistd.h>
 #include <time.h>
 #include <signal.h>
+#include <stdint.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+typedef int socklen_t;
+#define close closesocket
+#else
+#include <unistd.h>
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#endif
 
 #include "common.h"
 
@@ -40,9 +49,19 @@
 
 #define SEND_BUF_SIZE (8 * 1024 * 1024)
 
-#define min(a, b) ((a < b) ? a : b)
-#define max(a, b) ((a > b) ? a : b)
+#ifdef _WIN32
+#undef min
+#undef max
+#endif
+#ifndef min
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#endif
+#ifndef max
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#endif
+#ifndef min_max
 #define min_max(a, l, h) (max(min((a), (h)), (l)))
+#endif
 
 #define WINDOW_MIN 1
 #define WINDOW_DEF 20
@@ -221,12 +240,20 @@ conn_t *select_conn() {
 void handle_srt_data(int fd) {
   char buf[MTU];
   socklen_t len = sizeof(srt_addr);
+#ifdef _WIN32
+  int n = recvfrom(fd, (char*)buf, MTU, 0, (struct sockaddr*)&srt_addr, &len);
+#else
   int n = recvfrom(fd, &buf, MTU, 0, &srt_addr, &len);
+#endif
 
   conn_t *c = select_conn();
   if (c) {
     int32_t sn = get_srt_sn(buf, n);
+#ifdef _WIN32
+    int ret = sendto(c->fd, (const char*)buf, n, 0, (struct sockaddr*)&srtla_addr, addr_len);
+#else
     int ret = sendto(c->fd, &buf, n, 0, &srtla_addr, addr_len);
+#endif
     if (ret == n) {
       if (sn >= 0) {
         reg_pkt(c, sn);
@@ -330,8 +357,11 @@ void register_srt_ack(int32_t ack) {
 
 void handle_srtla_data(conn_t *c) {
   char buf[MTU];
-
+#ifdef _WIN32
+  int n = recvfrom(c->fd, (char*)buf, MTU, 0, NULL, NULL);
+#else
   int n = recvfrom(c->fd, &buf, MTU, 0, NULL, NULL);
+#endif
   if (n <= 0) return;
 
   time_t ts;
@@ -427,7 +457,7 @@ void handle_srtla_data(conn_t *c) {
       return;
   } // switch
 
-  sendto(listenfd, &buf, n, 0, &srt_addr, addr_len);
+  sendto(listenfd, (const char*)buf, n, 0, &srt_addr, addr_len);
 }
 
 
@@ -456,38 +486,62 @@ int setup_conns(char *source_ip_file) {
   int count = 0;
   char *line = NULL;
   size_t line_len = 0;
-  while(getline(&line, &line_len, config) >= 0) {
+#ifdef _WIN32
+// getline yok, yerine fgets ve dinamik buffer kullanalım
+#define LINE_BUF_SZ 256
+char win_line[LINE_BUF_SZ];
+while(fgets(win_line, LINE_BUF_SZ, config)) {
+    char *line = win_line;
     char *nl;
     if ((nl = strchr(line, '\n'))) {
-      *nl = '\0';
+        *nl = '\0';
     }
-
     struct sockaddr src;
-
     int ret = parse_ip((struct sockaddr_in *)&src, line);
     if (ret == 0) {
-      conn_t *c = conn_find_by_src(&src);
-      if (c == NULL) {
-        conn_t *c = calloc(1, sizeof(conn_t));
-        assert(c != NULL);
-
-        c->src = src;
-        c->fd = -1;
-        c->window = WINDOW_DEF * WINDOW_MULT;
-
-        c->next = conns;
-        conns = c;
-
-        count++;
-
-        printf("Added connection via %s (%p)\n", print_addr(&c->src), c);
-      } else {
-        c->removed = 0;
-      }
+        conn_t *c = conn_find_by_src(&src);
+        if (c == NULL) {
+            conn_t *c = calloc(1, sizeof(conn_t));
+            assert(c != NULL);
+            c->src = src;
+            c->fd = -1;
+            c->window = WINDOW_DEF * WINDOW_MULT;
+            c->next = conns;
+            conns = c;
+            count++;
+            printf("Added connection via %s (%p)\n", print_addr(&c->src), c);
+        } else {
+            c->removed = 0;
+        }
     }
-  }
-  if (line) free(line);
-
+}
+#else
+while(getline(&line, &line_len, config) >= 0) {
+    char *nl;
+    if ((nl = strchr(line, '\n'))) {
+        *nl = '\0';
+    }
+    struct sockaddr src;
+    int ret = parse_ip((struct sockaddr_in *)&src, line);
+    if (ret == 0) {
+        conn_t *c = conn_find_by_src(&src);
+        if (c == NULL) {
+            conn_t *c = calloc(1, sizeof(conn_t));
+            assert(c != NULL);
+            c->src = src;
+            c->fd = -1;
+            c->window = WINDOW_DEF * WINDOW_MULT;
+            c->next = conns;
+            conns = c;
+            count++;
+            printf("Added connection via %s (%p)\n", print_addr(&c->src), c);
+        } else {
+            c->removed = 0;
+        }
+    }
+}
+if (line) free(line);
+#endif
   fclose(config);
 
   return count;
@@ -533,14 +587,22 @@ int open_socket(conn_t *c, int quiet) {
   }
 
   // Set up the socket
+#ifdef _WIN32
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+#else
   int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+#endif
   if (fd < 0) {
     err("Failed to open a socket");
     return -1;
   }
 
   int bufsize = SEND_BUF_SIZE;
+#ifdef _WIN32
+  int ret = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
+#else
   int ret = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+#endif
   if (ret != 0) {
     err("failed to set send buffer size (%d)\n", bufsize);
     goto err;
@@ -589,8 +651,12 @@ void set_srtla_addr(struct addrinfo *addr) {
 void send_keepalive(conn_t *c) {
   debug("%s (%p): sending keepalive\n", print_addr(&c->src), c);
   uint16_t pkt = htobe16(SRTLA_TYPE_KEEPALIVE);
+#ifdef _WIN32
+    int ret = sendto(c->fd, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&srtla_addr, addr_len);
+#else
+    int ret = sendto(c->fd, &pkt, sizeof(pkt), 0, &srtla_addr, addr_len);
+#endif
   // ignoring the result on purpose
-  sendto(c->fd, &pkt, sizeof(pkt), 0, &srtla_addr, addr_len);
 }
 
 #define HOUSEKEEPING_INT 1000 // ms
@@ -693,6 +759,15 @@ void connection_housekeeping() {
 #define ARG_SRTLA_PORT  (argv[3])
 #define ARG_IPS_FILE    (argv[4])
 int main(int argc, char **argv) {
+#ifdef _WIN32
+  // Windows için Winsock başlatma
+  WSADATA wsaData;
+  int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+  if (wsaResult != 0) {
+    fprintf(stderr, "WSAStartup failed: %d\n", wsaResult);
+    return 1;
+  }
+#endif
   if (argc == 2 && strcmp(argv[1], "-v") == 0) {
     printf(VERSION "\n");
     exit(0);
@@ -707,15 +782,29 @@ int main(int argc, char **argv) {
   }
 
   struct sockaddr_in listen_addr;
-
   int port = parse_port(ARG_LISTEN_PORT);
   if (port < 0) exit_help();
 
   // Read a random connection group id for this session
+#ifdef _WIN32
+  // Windows'ta /dev/urandom yok, bunun yerine CryptGenRandom kullanabiliriz
+  HCRYPTPROV hCryptProv;
+  if (!CryptAcquireContext(&hCryptProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+    fprintf(stderr, "CryptAcquireContext failed: %lu\n", GetLastError());
+    exit(EXIT_FAILURE);
+  }
+  if (!CryptGenRandom(hCryptProv, SRTLA_ID_LEN, (BYTE*)srtla_id)) {
+    fprintf(stderr, "CryptGenRandom failed: %lu\n", GetLastError());
+    CryptReleaseContext(hCryptProv, 0);
+    exit(EXIT_FAILURE);
+  }
+  CryptReleaseContext(hCryptProv, 0);
+#else
   FILE *fd = fopen("/dev/urandom", "rb");
   assert(fd != NULL);
   assert(fread(srtla_id, 1, SRTLA_ID_LEN, fd) == SRTLA_ID_LEN);
   fclose(fd);
+#endif
 
   FD_ZERO(&active_fds);
 
@@ -754,7 +843,9 @@ int main(int argc, char **argv) {
 
   set_srtla_addr(addrs);
 
+#ifndef _WIN32
   signal(SIGHUP, schedule_update_conns);
+#endif
 
   int info_int = LOG_PKT_INT;
 
@@ -788,7 +879,12 @@ int main(int argc, char **argv) {
         debug("%s (%p): in flight: %d, window: %d, last_rcvd %ld\n",
               print_addr(&c->src), c, c->in_flight_pkts, c->window, c->last_rcvd);
       }
-      info_int = LOG_PKT_INT;
-    }
-  } // while(1);
+      info_int = LOG_PKT_INT;    }
+  } // while(1)
+
+#ifdef _WIN32
+  WSACleanup(); // Bu satır hiçbir zaman çalışmayacak çünkü while(1) döngüsünden çıkış yok, 
+                // ama kodun doğruluğu için ekliyoruz
+#endif
+  return 0;
 }

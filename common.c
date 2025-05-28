@@ -16,12 +16,22 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-#include <endian.h>
-#include <stdlib.h>
-#include <string.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#include <stdio.h> // For fprintf and stderr
+#define htobe32(x) htonl(x)
+#define be32toh(x) ntohl(x)
+typedef unsigned long in_addr_t; // Define in_addr_t for Windows
+#else
 #include <sys/socket.h>
+#include <endian.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#endif
+
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "common.h"
@@ -145,3 +155,14 @@ int is_srtla_reg3(void *pkt, int len) {
   if (len != SRTLA_TYPE_REG3_LEN) return 0;
   return get_srt_type(pkt, len) == SRTLA_TYPE_REG3;
 }
+
+// Ensure WSAStartup is initialized for Windows
+#ifdef _WIN32
+void initialize_winsock() {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        exit(EXIT_FAILURE);
+    }
+}
+#endif

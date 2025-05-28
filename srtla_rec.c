@@ -20,12 +20,31 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <endian.h>
-#include <netdb.h>
-#include <sys/types.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#include <stdio.h>
+#define htobe32(x) htonl(x)
+#define be32toh(x) ntohl(x)
+typedef unsigned long in_addr_t; // Define in_addr_t for Windows
+
+// Update sendto, recv, and recvfrom calls for Winsock compatibility
+#define SENDTO(sock, buf, len, flags, addr, addrlen) sendto(sock, (char *)(buf), len, flags, addr, addrlen)
+#define RECV(sock, buf, len, flags) recv(sock, (char *)(buf), len, flags)
+#define RECVFROM(sock, buf, len, flags, addr, addrlen) recvfrom(sock, (char *)(buf), len, flags, addr, addrlen)
+#else
 #include <sys/socket.h>
+#include <endian.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#define SENDTO(sock, buf, len, flags, addr, addrlen) sendto(sock, buf, len, flags, addr, addrlen)
+#define RECV(sock, buf, len, flags) recv(sock, buf, len, flags)
+#define RECVFROM(sock, buf, len, flags, addr, addrlen) recvfrom(sock, buf, len, flags, addr, addrlen)
+#endif
+#ifndef _WIN32
+#include <netdb.h>
+#endif
+#include <sys/types.h>
 #ifdef __linux__
 #include <sys/epoll.h>
 #endif
@@ -119,12 +138,26 @@ int const_time_cmp(const void *a, const void *b, int len) {
 }
 
 int get_random(void *dest, size_t len) {
+#ifdef _WIN32
+  // Windows'ta CryptGenRandom kullanarak rastgele sayı üret
+  HCRYPTPROV hCryptProv;
+  if (!CryptAcquireContext(&hCryptProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+    fprintf(stderr, "CryptAcquireContext failed: %lu\n", GetLastError());
+    return -1;
+  }
+  
+  BOOL result = CryptGenRandom(hCryptProv, (DWORD)len, (BYTE*)dest);
+  CryptReleaseContext(hCryptProv, 0);
+  
+  return result ? 0 : -1;
+#else
   while (len) {
     int ret = fread(dest, 1, len, urandom);
     if (ret <= 0) return -1;
     len -= ret;
   }
   return 0;
+#endif
 }
 
 
@@ -264,7 +297,7 @@ int group_reg(struct sockaddr *addr, char *in_buf, time_t ts) {
   memcpy(out_buf + sizeof(header), g->id, SRTLA_ID_LEN);
 
   // Send the REG2 packet
-  ret = sendto(srtla_sock, &out_buf, sizeof(out_buf), 0, addr, addr_len);
+  ret = SENDTO(srtla_sock, out_buf, sizeof(out_buf), 0, addr, addr_len);
   if (ret != sizeof(out_buf)) goto err_destroy;
 
   info("%s:%d: group %p registered\n", print_addr(addr), port_no(addr), g);
@@ -281,7 +314,7 @@ err_destroy:
 err:
   err("%s:%d: group registration failed\n", print_addr(addr), port_no(addr));
   header = htobe16(SRTLA_TYPE_REG_ERR);
-  sendto(srtla_sock, &header, sizeof(header), 0, addr, addr_len);
+  SENDTO(srtla_sock, &header, sizeof(header), 0, addr, addr_len);
   return -1;
 }
 
@@ -293,7 +326,7 @@ int conn_reg(struct sockaddr *addr, char *in_buf, time_t ts) {
   g = group_find_by_id(id);
   if (g == NULL) {
     uint16_t header = htobe16(SRTLA_TYPE_REG_NGP);
-    sendto(srtla_sock, &header, sizeof(header), 0, addr, addr_len);
+    SENDTO(srtla_sock, &header, sizeof(header), 0, addr, addr_len);
     goto err_early;
   }
 
@@ -321,7 +354,7 @@ int conn_reg(struct sockaddr *addr, char *in_buf, time_t ts) {
   }
 
   uint16_t header = htobe16(SRTLA_TYPE_REG3);
-  ret = sendto(srtla_sock, &header, sizeof(header), 0, addr, addr_len);
+  ret = SENDTO(srtla_sock, &header, sizeof(header), 0, addr, addr_len);
   if (ret != sizeof(header)) goto err_destroy;
 
   info("%s:%d (group %p): connection registration\n", print_addr(addr), port_no(addr), g);
@@ -337,7 +370,7 @@ err_destroy:
 
 err:
   header = htobe16(SRTLA_TYPE_REG_ERR);
-  sendto(srtla_sock, &header, sizeof(header), 0, addr, addr_len);
+  SENDTO(srtla_sock, &header, sizeof(header), 0, addr, addr_len);
 
 err_early:
   err("%s:%d: connection registration for group %p failed\n",
@@ -360,7 +393,7 @@ void handle_srt_data(conn_group_t *g) {
 
   if (g == NULL) return;
 
-  int n = recv(g->srt_sock, &buf, MTU, 0);
+  int n = RECV(g->srt_sock, &buf, MTU, 0);
   if (n < SRT_MIN_LEN) {
     err("Group %p: failed to read the SRT sock, terminating the group\n", g);
     group_destroy(g, NULL);
@@ -371,7 +404,7 @@ void handle_srt_data(conn_group_t *g) {
   if (is_srt_ack(buf, n)) {
     // Broadcast SRT ACKs over all connections for timely delivery
     for (conn_t *c = g->conns; c != NULL; c = c->next) {
-      int ret = sendto(srtla_sock, &buf, n, 0, &c->addr, addr_len);
+      int ret = SENDTO(srtla_sock, &buf, n, 0, &c->addr, addr_len);
       if (ret != n) {
         err("%s:%d (group %p): failed to send the SRT ack\n",
             print_addr(&c->addr), port_no(&c->addr), g);
@@ -379,7 +412,7 @@ void handle_srt_data(conn_group_t *g) {
     }
   } else {
     // send other packets over the most recently used SRTLA connection
-    int ret = sendto(srtla_sock, &buf, n, 0, &g->last_addr, addr_len);
+    int ret = SENDTO(srtla_sock, &buf, n, 0, &g->last_addr, addr_len);
     if (ret != n) {
       err("%s:%d (group %p): failed to send the SRT packet\n",
           print_addr(&g->last_addr), port_no(&g->last_addr), g);
@@ -396,7 +429,7 @@ void register_packet(conn_group_t *g, conn_t *c, int32_t sn) {
     ack.type = htobe32(SRTLA_TYPE_ACK << 16);
     memcpy(&ack.acks, &c->recv_log, sizeof(c->recv_log));
 
-    int ret = sendto(srtla_sock, &ack, sizeof(ack), 0, &c->addr, addr_len);
+    int ret = SENDTO(srtla_sock, &ack, sizeof(ack), 0, &c->addr, addr_len);
     if (ret != sizeof(ack)) {
       err("%s:%d (group %p): failed to send the srtla ack\n",
           print_addr(&c->addr), port_no(&c->addr), g);
@@ -413,7 +446,7 @@ void handle_srtla_data(time_t ts) {
   // Get the packet
   struct sockaddr srtla_addr;
   socklen_t len = addr_len;
-  int n = recvfrom(srtla_sock, &buf, MTU, 0, &srtla_addr, &len);
+  int n = recvfrom(srtla_sock, buf, MTU, 0, &srtla_addr, &len);
   if (n < 0) {
     err("Failed to read a srtla packet\n");
     return;
@@ -441,7 +474,7 @@ void handle_srtla_data(time_t ts) {
 
   // Resend SRTLA keep-alive packets to the sender
   if (is_srtla_keepalive(buf, n)) {
-    int ret = sendto(srtla_sock, &buf, n, 0, &srtla_addr, addr_len);
+    int ret = SENDTO(srtla_sock, &buf, n, 0, &srtla_addr, addr_len);
     if (ret != n) {
       err("%s:%d (group %p): failed to send the srtla keepalive\n",
           print_addr(&srtla_addr), port_no(&srtla_addr), g);
@@ -488,7 +521,7 @@ void handle_srtla_data(time_t ts) {
 #endif
   }
 
-  ret = send(g->srt_sock, &buf, n, 0);
+  ret = send(g->srt_sock, buf, n, 0);
   if (ret != n) {
     err("Group %p: failed to forward the srtla packet, terminating the group\n", g);
     group_destroy(g, NULL);
@@ -583,9 +616,12 @@ int resolve_srt_addr(char *host, char *port) {
     perror("failed to create a UDP socket");
     return -1;
   }
-
   struct timeval to = { .tv_sec = 1, .tv_usec = 0};
+#ifdef _WIN32
+  ret = setsockopt(tmp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+#else
   ret = setsockopt(tmp_sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+#endif
   if (ret != 0) {
     perror("failed to set a socket timeout");
     return -1;
@@ -596,14 +632,15 @@ int resolve_srt_addr(char *host, char *port) {
     info("Trying to connect to SRT at %s:%s... ", print_addr(addr->ai_addr), port);
     /* We're not printing this at all log levels, but a
        flush won't hurt if we didn't print anything */
-    fflush(stderr);
-
-    ret = connect(tmp_sock, addr->ai_addr, addr->ai_addrlen);
+    fflush(stderr);    ret = connect(tmp_sock, addr->ai_addr, addr->ai_addrlen);
     if (ret == 0) {
+#ifdef _WIN32
+      ret = send(tmp_sock, (const char*)&hs_packet, sizeof(hs_packet), 0);
+#else
       ret = send(tmp_sock, &hs_packet, sizeof(hs_packet), 0);
-      if (ret == sizeof(hs_packet)) {
-        char buf[MTU];
-        ret = recv(tmp_sock, &buf, MTU, 0);
+#endif
+      if (ret == sizeof(hs_packet)) {        char buf[MTU];
+        ret = recv(tmp_sock, buf, MTU, 0);
         if (ret == sizeof(hs_packet)) {
           info("success\n");
           srt_addr = *addr->ai_addr;
@@ -634,6 +671,15 @@ int resolve_srt_addr(char *host, char *port) {
 #define ARG_SRT_HOST    (argv[2])
 #define ARG_SRT_PORT    (argv[3])
 int main(int argc, char **argv) {
+#ifdef _WIN32
+  // Windows için Winsock başlatma
+  WSADATA wsaData;
+  int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+  if (wsaResult != 0) {
+    fprintf(stderr, "WSAStartup failed: %d\n", wsaResult);
+    return 1;
+  }
+#endif
   // Command line argument parsing
   if (argc == 2 && strcmp(argv[1], "-v") == 0) {
     printf(VERSION "\n");
@@ -645,19 +691,22 @@ int main(int argc, char **argv) {
 
   int srtla_port = parse_port(ARG_LISTEN_PORT);
   if (srtla_port < 0) exit_help();
-
   // Try to detect if the SRT server is reachable.
   int ret = resolve_srt_addr(ARG_SRT_HOST, ARG_SRT_PORT);
   if (ret < 0) {
     exit(EXIT_FAILURE);
   }
 
+#ifdef _WIN32
+  // Windows'ta urandom yerine CryptGenRandom kullanacağız, bu değişkene ihtiyaç yok
+#else
   // urandom is used to generate random ids
   urandom = fopen("/dev/urandom", "rb");
   if (urandom == NULL) {
     perror("failed to open urandom\n");
     exit(EXIT_FAILURE);
   }
+#endif
 
 #ifdef __linux__
   // We use epoll for event-driven network I/O
@@ -743,10 +792,14 @@ int main(int argc, char **argv) {
         if (g->srt_sock > 0 && FD_ISSET(g->srt_sock, &readfds)) {
           handle_srt_data(g);
         }
-      }
-    }
+      }    }
     connection_cleanup(ts);
 #endif
   } // while(1);
+
+#ifdef _WIN32
+  WSACleanup(); // Bu satır hiçbir zaman çalışmayacak çünkü while(1) döngüsünden çıkış yok, 
+                // ama kodun doğruluğu için ekliyoruz
+#endif
 }
 
