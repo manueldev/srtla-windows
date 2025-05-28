@@ -1,29 +1,89 @@
-name: Build and Release
+name: Build and Release SRTLA for Windows
 
 on:
   push:
     tags:
       - 'v*'   # Sadece v ile başlayan tag'lerde tetiklenir
+  workflow_dispatch:  # Manuel tetiklemek için
 
 jobs:
-  build:
+  build-windows:
+    name: Build Windows Binaries
     runs-on: windows-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Run make
-        run: make
-
-      - name: List files
-        run: dir
-
-      - name: Upload release assets
+        with:
+          fetch-depth: 0  # Tüm commit geçmişini al (version bilgisi için)
+      
+      - name: Set up MinGW (GCC for Windows)
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+      
+      - name: Get tag name
+        id: get_tag
+        run: echo "TAG_NAME=${{ github.ref_name }}" >> $env:GITHUB_ENV
+        shell: pwsh
+      
+      - name: Show environment
+        run: |
+          echo "Checking build environment..."
+          gcc --version
+          mingw32-make --version
+          git --version
+        shell: cmd
+      
+      - name: Build SRTLA Binaries
+        run: |
+          mingw32-make
+          dir
+        shell: cmd
+      
+      - name: Package Release Files
+        run: |
+          mkdir release-files
+          copy srtla_rec.exe release-files\
+          copy srtla_send.exe release-files\
+          copy README-windows.md release-files\README.md
+          copy LICENSE release-files\
+        shell: cmd
+      
+      - name: Create Release ZIP
+        run: |
+          cd release-files
+          7z a -tzip ..\srtla-windows-${{ env.TAG_NAME }}.zip *
+          cd ..
+          dir
+        shell: cmd
+      
+      - name: Create Release
+        id: create_release
         uses: softprops/action-gh-release@v1
         with:
+          name: SRTLA Windows Release ${{ env.TAG_NAME }}
+          body: |
+            # SRTLA Windows ${{ env.TAG_NAME }}
+            
+            Windows-compatible release for SRTLA with link aggregation.
+            
+            ## Improvements
+            - WSAStartup and WSACleanup support
+            - Windows cryptography API for random number generation
+            - Network socket compatibility fixes
+            - Windows service support with NSSM
+            
+            ## Usage
+            1. Download and extract the ZIP file
+            2. For receiver: `srtla_rec.exe [listen_port] [srt_host] [srt_port]`
+            3. For sender: `srtla_send.exe [listen_port] [srtla_host] [srtla_port] [source_ips_file]`
+            
+            For detailed instructions, see the included README.md file.
+          
           files: |
-            ./srtla_rec.exe
-            ./srtla_send.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            srtla-windows-${{ env.TAG_NAME }}.zip
+            srtla_rec.exe
+            srtla_send.exe
+          draft: false
+          prerelease: false
