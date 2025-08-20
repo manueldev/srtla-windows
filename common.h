@@ -63,6 +63,41 @@ typedef struct __attribute__((__packed__)) {
   char     peer_ip[16];
 } srt_handshake_t;
 
+/* New states and connection enums for reconnection/resilience */
+typedef enum {
+  G_ACTIVE = 0,
+  G_WAITING_SRT,
+  G_CLOSED
+} group_state;
+
+typedef enum {
+  C_CONNECTING = 0,
+  C_REGISTERED,
+  C_RECONNECTING,
+  C_DEAD
+} conn_state;
+
+/* Reconnection and retry defaults (can be overridden at runtime) */
+#ifndef REG_RETRY_BASE_MS
+#define REG_RETRY_BASE_MS 250
+#endif
+#ifndef REG_RETRY_MAX_MS
+#define REG_RETRY_MAX_MS 4000
+#endif
+#ifndef REG_RETRY_MAX_ATTEMPTS
+#define REG_RETRY_MAX_ATTEMPTS 8
+#endif
+
+#ifndef CONN_DEAD_NO_ACTIVITY_MS
+#define CONN_DEAD_NO_ACTIVITY_MS 5000
+#endif
+
+/* Helper for more explanatory socket error strings */
+const char *sock_err_str();
+int is_fatal_udp_error(int err);
+int create_udp_socket(void);
+
+
 #define LOG_NONE    0   // prints only fatal errors
 #define LOG_ERR     1   // prints errors we can tolerate
 #define LOG_INFO    2   // prints informational messages

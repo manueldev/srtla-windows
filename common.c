@@ -41,6 +41,66 @@ void exit_help() {
   exit(EXIT_FAILURE);
 }
 
+/* Return a textual representation of the last socket error. On Windows use
+   WSAGetLastError(), otherwise errno */
+const char *sock_err_str() {
+#ifdef _WIN32
+  static char buf[256];
+  int e = WSAGetLastError();
+  FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                 NULL, e, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf, sizeof(buf), NULL);
+  return buf;
+#else
+  return strerror(errno);
+#endif
+}
+
+int is_fatal_udp_error(int err) {
+#ifdef _WIN32
+  switch (err) {
+    case WSAENETUNREACH:
+    case WSAEHOSTUNREACH:
+    case WSAEADDRNOTAVAIL:
+    case WSAECONNRESET:
+      return 1;
+    default:
+      return 0;
+  }
+#else
+  switch (err) {
+    case ENETUNREACH:
+    case EHOSTUNREACH:
+    case EADDRNOTAVAIL:
+    case ECONNRESET:
+      return 1;
+    default:
+      return 0;
+  }
+#endif
+}
+
+/* Create a UDP socket and apply platform-specific hardening (Windows SIO_UDP_CONNRESET) */
+int create_udp_socket() {
+  int s;
+#ifdef _WIN32
+  s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (s == INVALID_SOCKET) return -1;
+  // Disable ICMP port unreachable generating WSAECONNRESET on recv/send
+  // Some Windows toolchains may not define SIO_UDP_CONNRESET; only call when available.
+  #ifdef SIO_UDP_CONNRESET
+  DWORD bytes = 0;
+  BOOL b = FALSE;
+  WSAIoctl(s, SIO_UDP_CONNRESET, &b, sizeof(b), NULL, 0, &bytes, NULL, NULL);
+  #else
+  /* SIO_UDP_CONNRESET not defined on this platform; skipping WSAIoctl.
+    This avoids compile failures on some MinGW/MSVCRT setups. */
+  #endif
+#else
+  s = socket(AF_INET, SOCK_DGRAM, 0);
+#endif
+  return s;
+}
+
 #define ADDR_BUF_SZ 50
 char _global_addr_buf[ADDR_BUF_SZ];
 const char *print_addr(struct sockaddr *addr) {

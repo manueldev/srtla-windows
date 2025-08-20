@@ -66,6 +66,11 @@ typedef struct srtla_conn {
   time_t last_rcvd;
   int recv_idx;
   uint32_t recv_log[RECV_ACK_INT];
+  /* registration / reconnect state */
+  int reg_attempts;
+  time_t next_reg_try_ms;
+  int backoff_ms;
+  int had_fatal_error;
 } conn_t;
 
 typedef struct srtla_conn_group {
@@ -75,9 +80,26 @@ typedef struct srtla_conn_group {
   int srt_sock;
   struct sockaddr last_addr;
   char id[SRTLA_ID_LEN];
+  /* reconnection state */
+  uint64_t logical_group_id;
+  group_state state;
+  time_t next_srt_retry_ms;
+  int srt_retry_attempts;
 } conn_group_t;
 
 typedef struct {
+
+/*
+Manual testing scenarios:
+
+1) Start receiver + SRT listener + sender. Verify streaming flows normally.
+2) Stop SRT listener (e.g., OBS). Verify receiver logs entering WAITING_SRT and schedules retries.
+3) Restart SRT listener. Verify receiver transitions back to ACTIVE automatically.
+4) On sender, disable a network interface and confirm only that connection reconnects while others remain.
+5) Force ICMP Port Unreachable on Windows (close receiver port briefly) and confirm sockets are recreated and registration retried.
+6) Repeatedly bring down/up SRT listener and confirm no unbounded memory growth (use counters/logs).
+
+*/
   uint32_t type;
   uint32_t acks[RECV_ACK_INT];
 } srtla_ack_pkt;
@@ -89,6 +111,12 @@ const socklen_t addr_len = sizeof(struct sockaddr);
 
 conn_group_t *groups = NULL;
 int group_count = 0;
+static uint64_t global_group_seq = 1;
+
+/* runtime flags */
+int flag_auto_reconnect = 1;
+int flag_log_errors = 0;
+int flag_reconnect_interval_ms = 500;
 
 FILE *urandom;
 
@@ -215,6 +243,10 @@ conn_group_t *group_create(char *sender_id, time_t ts) {
   memcpy(&g->id, id, SRTLA_ID_LEN);
   g->conns = NULL;
   g->srt_sock = -1;
+  g->logical_group_id = global_group_seq++;
+  g->state = G_ACTIVE;
+  g->next_srt_retry_ms = 0;
+  g->srt_retry_attempts = 0;
   g->created_at = ts;
   g->next = groups;
   groups = g;
@@ -300,7 +332,7 @@ int group_reg(struct sockaddr *addr, char *in_buf, time_t ts) {
   ret = SENDTO(srtla_sock, out_buf, sizeof(out_buf), 0, addr, addr_len);
   if (ret != sizeof(out_buf)) goto err_destroy;
 
-  info("%s:%d: group %p registered\n", print_addr(addr), port_no(addr), g);
+  info("%s:%d: group #%llu registered\n", print_addr(addr), port_no(addr), (unsigned long long)g->logical_group_id);
 
   // Only count the group after everything else succeeded
   group_count++;
@@ -395,8 +427,22 @@ void handle_srt_data(conn_group_t *g) {
 
   int n = RECV(g->srt_sock, &buf, MTU, 0);
   if (n < SRT_MIN_LEN) {
-    err("Group %p: failed to read the SRT sock, terminating the group\n", g);
-    group_destroy(g, NULL);
+    int e = errno;
+    if (flag_log_errors) err("Group #%llu (ptr=%p): SRT read failed (err=%s). Entering WAITING_SRT\n", (unsigned long long)g->logical_group_id, g, sock_err_str());
+    else err("Group %p: failed to read the SRT sock, entering WAITING_SRT\n", g);
+    // Close socket and mark for retry rather than destroying the whole group
+    if (g->srt_sock > 0) { close(g->srt_sock); }
+    g->srt_sock = -1;
+    if (flag_auto_reconnect) {
+      g->state = G_WAITING_SRT;
+      g->srt_retry_attempts++;
+      g->next_srt_retry_ms = time(NULL) * 1000 + flag_reconnect_interval_ms * (1 << (g->srt_retry_attempts - 1));
+      if (g->next_srt_retry_ms - (time(NULL)*1000) > REG_RETRY_MAX_MS) {
+        g->next_srt_retry_ms = time(NULL)*1000 + REG_RETRY_MAX_MS;
+      }
+    } else {
+      group_destroy(g, NULL);
+    }
     return;
   }
 
@@ -406,16 +452,33 @@ void handle_srt_data(conn_group_t *g) {
     for (conn_t *c = g->conns; c != NULL; c = c->next) {
       int ret = SENDTO(srtla_sock, &buf, n, 0, &c->addr, addr_len);
       if (ret != n) {
-        err("%s:%d (group %p): failed to send the SRT ack\n",
-            print_addr(&c->addr), port_no(&c->addr), g);
+    if (flag_log_errors) err("%s:%d (group #%llu): failed to send the SRT ack (ret=%d, err=%s)\n",
+      print_addr(&c->addr), port_no(&c->addr), (unsigned long long)g->logical_group_id, ret, sock_err_str());
+    else err("%s:%d (group %p): failed to send the SRT ack\n",
+      print_addr(&c->addr), port_no(&c->addr), g);
       }
     }
   } else {
     // send other packets over the most recently used SRTLA connection
     int ret = SENDTO(srtla_sock, &buf, n, 0, &g->last_addr, addr_len);
     if (ret != n) {
-      err("%s:%d (group %p): failed to send the SRT packet\n",
+      int serr = errno;
+      if (flag_log_errors) err("%s:%d (group #%llu): failed to send the SRT packet (ret=%d, err=%s)\n",
+          print_addr(&g->last_addr), port_no(&g->last_addr), (unsigned long long)g->logical_group_id, ret, sock_err_str());
+      else err("%s:%d (group %p): failed to send the SRT packet\n",
           print_addr(&g->last_addr), port_no(&g->last_addr), g);
+      // If fatal, mark connection for reconnect
+      if (is_fatal_udp_error(serr)) {
+        // remove the connection immediately
+        for (conn_t **it = &g->conns; *it != NULL; it = &((*it)->next)) {
+          if (const_time_cmp(&((*it)->addr), &g->last_addr, addr_len) == 0) {
+            conn_t *dead = *it;
+            *it = dead->next;
+            free(dead);
+            break;
+          }
+        }
+      }
     }
   }
 }
@@ -496,9 +559,17 @@ void handle_srtla_data(time_t ts) {
 
   // Open a connection to the SRT server for the group
   if (g->srt_sock < 0) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = create_udp_socket();
     if (sock < 0) {
-      err("Group %p: failed to create an SRT socket\n", g);
+      err("Group #%llu: failed to create an SRT socket (%s)\n", (unsigned long long)g->logical_group_id, sock_err_str());
+      if (flag_auto_reconnect) {
+        g->state = G_WAITING_SRT;
+        g->srt_retry_attempts++;
+        uint64_t now = 0; get_ms(&now);
+        int backoff = min(flag_reconnect_interval_ms << (g->srt_retry_attempts - 1), REG_RETRY_MAX_MS);
+        g->next_srt_retry_ms = now + backoff;
+        return;
+      }
       group_destroy(g, NULL);
       return;
     }
@@ -506,7 +577,17 @@ void handle_srtla_data(time_t ts) {
 
     int ret = connect(sock, &srt_addr, addr_len);
     if (ret != 0) {
-      err("Group %p: failed to connect() the SRT socket\n", g);
+      err("Group #%llu: failed to connect() the SRT socket (%s)\n", (unsigned long long)g->logical_group_id, sock_err_str());
+      close(sock);
+      g->srt_sock = -1;
+      if (flag_auto_reconnect) {
+        g->state = G_WAITING_SRT;
+        g->srt_retry_attempts++;
+        uint64_t now = 0; get_ms(&now);
+        int backoff = min(flag_reconnect_interval_ms << (g->srt_retry_attempts - 1), REG_RETRY_MAX_MS);
+        g->next_srt_retry_ms = now + backoff;
+        return;
+      }
       group_destroy(g, NULL);
       return;
     }
@@ -514,7 +595,15 @@ void handle_srtla_data(time_t ts) {
 #ifdef __linux__
     ret = epoll_add(sock, EPOLLIN, g);
     if (ret < 0) {
-      err("Group %p: failed to add the SRT socket to the epoll\n", g);
+      err("Group #%llu: failed to add the SRT socket to the epoll\n", (unsigned long long)g->logical_group_id);
+      close(sock);
+      g->srt_sock = -1;
+      if (flag_auto_reconnect) {
+        g->state = G_WAITING_SRT;
+        uint64_t now = 0; get_ms(&now);
+        g->next_srt_retry_ms = now + flag_reconnect_interval_ms;
+        return;
+      }
       group_destroy(g, NULL);
       return;
     }
@@ -577,6 +666,61 @@ void connection_cleanup(time_t ts) {
       continue;
     }
     prev_g = &g->next;
+  }
+
+  /* Also attempt SRT re-handshake for groups in WAITING_SRT state */
+  for (conn_group_t *g = groups; g != NULL; g = g->next) {
+    if (g->state == G_WAITING_SRT) {
+      uint64_t now_ms = 0;
+      uint64_t tmp = 0;
+      if (get_ms(&tmp) == 0) now_ms = tmp;
+      if (now_ms >= (uint64_t)g->next_srt_retry_ms) {
+        // Try to handshake with the existing srt_addr
+        info("Group #%llu: retrying SRT handshake attempt %d\n", (unsigned long long)g->logical_group_id, g->srt_retry_attempts);
+        srt_handshake_t hs_packet = {0};
+        hs_packet.header.type = htobe16(SRT_TYPE_HANDSHAKE);
+        hs_packet.version = htobe32(4);
+        hs_packet.ext_field = htobe16(2);
+        hs_packet.handshake_type = htobe32(1);
+
+        int sock = create_udp_socket();
+        if (sock >= 0) {
+          struct timeval to = { .tv_sec = 1, .tv_usec = 0 };
+#ifdef _WIN32
+          setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+#else
+          setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+#endif
+          if (connect(sock, &srt_addr, addr_len) == 0) {
+            int sent = send(sock, (const char*)&hs_packet, sizeof(hs_packet), 0);
+            if (sent == sizeof(hs_packet)) {
+              char buf[MTU];
+              int r = recv(sock, buf, MTU, 0);
+              if (r == sizeof(hs_packet)) {
+                // success
+                g->srt_sock = sock;
+                g->state = G_ACTIVE;
+                g->srt_retry_attempts = 0;
+                info("Group #%llu: SRT handshake succeeded, group ACTIVE\n", (unsigned long long)g->logical_group_id);
+                // continue to next group
+                continue;
+              }
+            }
+          }
+          close(sock);
+        }
+
+        if (g->state != G_ACTIVE) {
+          g->srt_retry_attempts++;
+          int backoff = REG_RETRY_BASE_MS << (g->srt_retry_attempts - 1);
+          if (backoff > REG_RETRY_MAX_MS) backoff = REG_RETRY_MAX_MS;
+          uint64_t now = 0;
+          get_ms(&now);
+          g->next_srt_retry_ms = now + backoff;
+          info("Group #%llu: scheduling next SRT retry in %d ms\n", (unsigned long long)g->logical_group_id, backoff);
+        }
+      }
+    }
   }
 
   debug("Clean up run ended. Counted %d groups and %d connections. "
@@ -681,11 +825,27 @@ int main(int argc, char **argv) {
   }
 #endif
   // Command line argument parsing
-  if (argc == 2 && strcmp(argv[1], "-v") == 0) {
+  if (argc >= 2 && strcmp(argv[1], "-v") == 0) {
     printf(VERSION "\n");
     exit(0);
   }
-  if (argc != 4) exit_help();
+  if (argc < 4) exit_help();
+
+  // parse optional flags after positional args
+  for (int i = 4; i < argc; i++) {
+    if (strcmp(argv[i], "--no-auto-reconnect") == 0) {
+      flag_auto_reconnect = 0;
+    } else if (strcmp(argv[i], "--auto-reconnect") == 0) {
+      flag_auto_reconnect = 1;
+    } else if (strcmp(argv[i], "--log-errors") == 0) {
+      flag_log_errors = 1;
+    } else if (strcmp(argv[i], "--reconnect-interval-ms") == 0 && i + 1 < argc) {
+      flag_reconnect_interval_ms = atoi(argv[i+1]);
+      i++;
+    } else {
+      err("Warning: unknown option %s\n", argv[i]);
+    }
+  }
 
   struct sockaddr_in listen_addr;
 

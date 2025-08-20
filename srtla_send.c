@@ -83,6 +83,11 @@ typedef struct conn {
   int window;
   int pkt_idx;
   int pkt_log[PKT_LOG_SZ];
+  /* reconnection/registration state */
+  int reg_attempts;
+  uint64_t next_reg_try_ms;
+  int backoff_ms;
+  conn_state cstate;
 } conn_t;
 
 char *source_ip_file = NULL;
@@ -97,6 +102,11 @@ conn_t *conns = NULL;
 int listenfd;
 int active_connections = 0;
 int has_connected = 0;
+
+/* runtime flags */
+int flag_auto_reconnect = 1;
+int flag_log_errors = 0;
+int flag_reconnect_interval_ms = 500;
 
 conn_t *pending_reg2_conn = NULL;
 time_t pending_reg_timeout = 0;
@@ -587,13 +597,9 @@ int open_socket(conn_t *c, int quiet) {
   }
 
   // Set up the socket
-#ifdef _WIN32
-  int fd = socket(AF_INET, SOCK_DGRAM, 0);
-#else
-  int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-#endif
+  int fd = create_udp_socket();
   if (fd < 0) {
-    err("Failed to open a socket");
+    err("Failed to open a socket: %s\n", sock_err_str());
     return -1;
   }
 
@@ -697,6 +703,12 @@ void connection_housekeeping() {
         for (int i = 0; i < PKT_LOG_SZ; i++) {
           c->pkt_log[i] = -1;
         }
+        // start reconnection/reg retry state
+        c->reg_attempts = 0;
+        c->backoff_ms = REG_RETRY_BASE_MS;
+        c->cstate = C_CONNECTING;
+        uint64_t now = 0; get_ms(&now);
+        c->next_reg_try_ms = now; // immediate
       }
 
       if (pending_reg2_conn == NULL) {
@@ -707,6 +719,25 @@ void connection_housekeeping() {
         send_reg1(c);
       }
       continue;
+    }
+
+    // handle registration retries/backoff
+    uint64_t now_ms = 0; get_ms(&now_ms);
+    if (c->cstate != C_REGISTERED && now_ms >= c->next_reg_try_ms) {
+      if (c->reg_attempts >= REG_RETRY_MAX_ATTEMPTS) {
+        err("%s (%p): registration attempts exceeded\n", print_addr(&c->src), c);
+        c->cstate = C_DEAD;
+      } else {
+        // attempt a REG1/REG2 depending on pending state
+        if (pending_reg2_conn == NULL) {
+          send_reg1(c);
+        } else {
+          send_reg2(c);
+        }
+        c->reg_attempts++;
+        c->backoff_ms = min(c->backoff_ms * 2, REG_RETRY_MAX_MS);
+        c->next_reg_try_ms = now_ms + c->backoff_ms;
+      }
     }
 
     /* If a connection has received data in the last CONN_TIMEOUT seconds,
@@ -772,7 +803,22 @@ int main(int argc, char **argv) {
     printf(VERSION "\n");
     exit(0);
   }
-  if (argc != 5) exit_help();
+  if (argc < 5) exit_help();
+
+  for (int i = 5; i < argc; i++) {
+    if (strcmp(argv[i], "--no-auto-reconnect") == 0) {
+      flag_auto_reconnect = 0;
+    } else if (strcmp(argv[i], "--auto-reconnect") == 0) {
+      flag_auto_reconnect = 1;
+    } else if (strcmp(argv[i], "--log-errors") == 0) {
+      flag_log_errors = 1;
+    } else if (strcmp(argv[i], "--reconnect-interval-ms") == 0 && i + 1 < argc) {
+      flag_reconnect_interval_ms = atoi(argv[i+1]);
+      i++;
+    } else {
+      err("Warning: unknown option %s\n", argv[i]);
+    }
+  }
 
   source_ip_file = ARG_IPS_FILE;
   int conn_count = setup_conns(source_ip_file);

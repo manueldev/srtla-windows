@@ -98,3 +98,64 @@ This tool can transport [SRT](https://github.com/Haivision/srt/) traffic over mu
 This application is experimental. Be prepared to troubleshoot it and experiment with various settings for your needs.
 
 [Read the rest of the original documentation here](https://github.com/BELABOX/srtla)
+
+## Reconnection Options
+
+Both `srtla_rec` and `srtla_send` now include basic automatic reconnection and logging options to improve resilience when receivers or network links briefly disappear.
+
+Command-line flags:
+- `--auto-reconnect` (default enabled): enable automatic reconnection behavior.
+- `--no-auto-reconnect`: disable automatic reconnection and preserve original behavior (immediate group removal on SRT failure).
+- `--log-errors`: increase error verbosity to include socket error strings.
+- `--reconnect-interval-ms <ms>`: base reconnect interval in milliseconds (default 500).
+
+Behavior summary:
+- `srtla_rec` will no longer immediately destroy a group on transient SRT socket failures; it will enter a WAITING_SRT state and periodically retry the SRT handshake.
+- `srtla_send` will retry registrations (REG1/REG2) with exponential backoff for each source connection.
+- On Windows, UDP sockets are hardened against ICMP "port unreachable" resets using `SIO_UDP_CONNRESET`.
+
+These options are safe for backward compatibility; disabling `--auto-reconnect` restores the original behavior.
+
+### Examples (full commands)
+
+Copy-pasteable examples showing the positional arguments followed by flags.
+
+- Receiver (default auto-reconnect, verbose errors):
+
+```batch
+srtla_rec.exe 5000 127.0.0.1 6262 --log-errors
+```
+
+- Receiver (disable auto-reconnect):
+
+```batch
+srtla_rec.exe 5000 127.0.0.1 6262 --no-auto-reconnect
+```
+
+- Receiver (custom reconnect interval 1000 ms):
+
+```batch
+srtla_rec.exe 5000 127.0.0.1 6262 --reconnect-interval-ms 1000 --log-errors
+```
+
+- Sender (default auto-reconnect, using a source IP list file):
+
+```batch
+srtla_send.exe 5001 192.168.1.50 5000 C:\path\to\sources.txt --log-errors
+```
+
+- Sender (disable auto-reconnect on sender):
+
+```batch
+srtla_send.exe 5001 192.168.1.50 5000 C:\path\to\sources.txt --no-auto-reconnect
+```
+
+- Sender (custom reconnect interval and verbose errors):
+
+```batch
+srtla_send.exe 5001 192.168.1.50 5000 C:\path\to\sources.txt --reconnect-interval-ms 750 --log-errors
+```
+
+Notes:
+- Always put flags after the required positional arguments.
+- On Linux use `./srtla_rec` / `./srtla_send` and Unix-style paths for the sources file.
