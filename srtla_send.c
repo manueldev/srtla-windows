@@ -461,10 +461,12 @@ void handle_srtla_data(conn_t *c) {
       return; // don't send to SRT
 
     case SRTLA_TYPE_REG3:
+      c->cstate = C_REGISTERED; // <<< FIJA EL ESTADO PARA EVITAR RE-REGISTROS
       has_connected = 1;
       active_connections++;
       info("%s (%p): connection established\n", print_addr(&c->src), c);
       return;
+
   } // switch
 
   sendto(listenfd, (const char*)buf, n, 0, &srt_addr, addr_len);
